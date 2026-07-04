@@ -1,0 +1,6 @@
+.env
+.venv/
+.idea/
+*.png
+*.db
+__pycache__/

@@ -134,15 +134,24 @@ class BaseScraper(ABC):
 # WILDBERRIES
 # ==========================================
 class WildberriesScraper(BaseScraper):
-    SEARCH_URL = "https://search.wb.ru/exactmatch/ru/common/v9/search"
+    # WB периодически меняет версию этого эндпоинта (была v9, стало v18+),
+    # старые версии просто перестают работать и отдают ошибку в JSON.
+    # Если поиск снова "сломается" - открой wildberries.ru, F12 -> Network ->
+    # Fetch/XHR, вбей что-нибудь в поиск и посмотри актуальный URL запроса
+    # к search.wb.ru (заодно сверь там же dest=... для своего региона) -
+    # обнови версию и параметры тут.
+    SEARCH_URL = "https://search.wb.ru/exactmatch/ru/common/v18/search"
 
     def search(self, query):
         results = []
         params = {
-            "ab_testing": "false",
+            "ab_testid": "false",
             "appType": 1,
             "curr": "rub",
             "dest": config.WB_DEST_ID,
+            "inheritFilters": "false",
+            "lang": "ru",
+            "page": 1,
             "query": query,
             "resultset": "catalog",
             "sort": "popular",
@@ -174,10 +183,25 @@ class WildberriesScraper(BaseScraper):
                     attempt = attempt + 1
                     continue
 
-                resp.raise_for_status()
+                # ВАЖНО: раньше здесь сразу стоял raise_for_status() - при ошибке
+                # мы теряли тело ответа, а именно в нём WB объясняет, что не так
+                # (например: "поле resultset должно быть задано" - признак того,
+                # что версия API в SEARCH_URL устарела).
+                if resp.status_code != 200:
+                    log("[ENGINE WB]", "Ошибка API (" + str(resp.status_code) + "): " + resp.text[:300])
+                    break
+
                 data = resp.json()
 
-                products = data.get("products", [])
+                # WB иногда возвращает 200, но с ошибкой прямо в теле - тоже логируем,
+                # а не тихо считаем, что товаров просто нет.
+                if isinstance(data, dict) and data.get("error"):
+                    log("[ENGINE WB]", "API вернул ошибку в теле ответа: " + str(data.get("error")))
+                    break
+
+                # На разных версиях API товары лежат то в корне, то внутри "data" -
+                # проверяем оба варианта, чтобы не сломаться при очередном обновлении версии.
+                products = data.get("products") or data.get("data", {}).get("products", [])
                 log("[ENGINE WB]", "Товаров в ответе: " + str(len(products)))
 
                 if len(products) > 0:
@@ -243,75 +267,113 @@ class WildberriesScraper(BaseScraper):
 # OZON
 # ==========================================
 class OzonScraper(BaseScraper):
+    # Список признаков антибот-заглушки Ozon. Если в debug_screenshots увидишь
+    # новую формулировку блокировки - просто добавь её сюда строкой.
+    ANTIBOT_MARKERS = [
+        "нет соединения", "ошибка", "антибот", "доступ ограничен",
+        "подтвердите, что вы", "access denied", "captcha",
+        "checking your browser", "just a moment",
+    ]
+
     def search(self, query):
         results = []
         encoded_query = urllib.parse.quote(query)
         url = "https://www.ozon.ru/search/?text=" + encoded_query + "&from_global=true"
         log("[ENGINE OZON]", "Старт сканирования: " + url)
 
+        browser = None
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=config.HEADLESS)
-                context = browser.new_context(
-                    user_agent=USER_AGENT,
-                    viewport={"width": 1440, "height": 900},
-                    locale="ru-RU",
-                )
-                context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-                )
-                page = context.new_page()
-                page.goto(url, wait_until="networkidle", timeout=45000)
-                page.wait_for_timeout(3000)
-                scroll_to_load(page)
+                try:
+                    context = browser.new_context(
+                        user_agent=USER_AGENT,
+                        viewport={"width": 1440, "height": 900},
+                        locale="ru-RU",
+                    )
+                    context.add_init_script(
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                    )
+                    page = context.new_page()
 
-                page_title = page.title()
-                log("[ENGINE OZON]", "Заголовок страницы: " + repr(page_title))
-                log("[ENGINE OZON]", "Итоговый URL: " + page.url)
+                    # networkidle почти никогда не наступает на Ozon - у них постоянно
+                    # летит аналитика/трекинг в фоне, из-за этого раньше ловили таймаут
+                    # ещё до того, как страница успевала отрисоваться.
+                    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    page.wait_for_timeout(3000)
+                    scroll_to_load(page)
 
-                lowered_title = page_title.lower()
-                if "нет соединения" in lowered_title or "ошибка" in lowered_title:
-                    log("[ENGINE OZON]", "Похоже на антибот-заглушку Ozon (детект автоматизации).")
-
-                cards = page.locator('a[href*="/product/"]').all()[:20]
-                log("[ENGINE OZON]", "Найдено ссылок на товары: " + str(len(cards)))
-
-                if len(cards) == 0:
-                    screenshot_path = screenshot_name("ozon", query)
-                    page.screenshot(path=screenshot_path)
-                    log("[ENGINE OZON]", "Скриншот для диагностики: " + screenshot_path)
-
-                seen_urls = set()
-                for card in cards:
+                    page_title = page.title()
                     try:
-                        href = card.get_attribute("href")
-                        if not href or href in seen_urls:
+                        page_text_lower = page.locator("body").inner_text(timeout=2000).lower()
+                    except Exception:
+                        page_text_lower = ""
+
+                    log("[ENGINE OZON]", "Заголовок страницы: " + repr(page_title))
+                    log("[ENGINE OZON]", "Итоговый URL: " + page.url)
+
+                    title_lower = page_title.lower()
+                    is_blocked = any(
+                        marker in title_lower or marker in page_text_lower
+                        for marker in self.ANTIBOT_MARKERS
+                    )
+                    if is_blocked:
+                        log("[ENGINE OZON]", "Похоже на антибот-заглушку Ozon (детект автоматизации).")
+
+                    # Даём карточкам шанс подгрузиться, но не падаем, если не дождались -
+                    # попробуем собрать то, что уже успело отрисоваться в DOM.
+                    try:
+                        page.wait_for_selector('a[href*="/product/"]', timeout=10000)
+                    except Exception:
+                        pass
+
+                    cards = page.locator('a[href*="/product/"]').all()[:20]
+                    log("[ENGINE OZON]", "Найдено ссылок на товары: " + str(len(cards)))
+
+                    # Сохраняем скриншот + HTML при любом провале (не только когда
+                    # cards==0), чтобы можно было глазами посмотреть, что реально
+                    # прислал Ozon, а не гадать по логам.
+                    if len(cards) == 0 or is_blocked:
+                        screenshot_path = screenshot_name("ozon", query)
+                        page.screenshot(path=screenshot_path)
+                        html_path = screenshot_path.replace(".png", ".html")
+                        Path(html_path).write_text(page.content(), encoding="utf-8")
+                        log("[ENGINE OZON]", "Диагностика сохранена: " + screenshot_path + " и " + html_path)
+
+                    seen_urls = set()
+                    for card in cards:
+                        try:
+                            href = card.get_attribute("href")
+                            if not href or href in seen_urls:
+                                continue
+                            seen_urls.add(href)
+
+                            text = card.text_content(timeout=1000) or ""
+                            price = extract_price_ru(text)
+                            card_title = extract_title_generic(text)
+                            image_url = extract_image_url(card)
+
+                            if price > 0:
+                                if href.startswith("http"):
+                                    full_url = href
+                                else:
+                                    full_url = "https://www.ozon.ru" + href
+                                results.append({
+                                    "platform": "Ozon",
+                                    "title": card_title,
+                                    "price": price,
+                                    "url": full_url,
+                                    "image_url": image_url,
+                                    "location": None,
+                                })
+                        except Exception as card_err:
+                            log("[ENGINE OZON]", "Пропущена карточка: " + str(card_err))
                             continue
-                        seen_urls.add(href)
-
-                        text = card.text_content(timeout=1000) or ""
-                        price = extract_price_ru(text)
-                        card_title = extract_title_generic(text)
-                        image_url = extract_image_url(card)
-
-                        if price > 0:
-                            if href.startswith("http"):
-                                full_url = href
-                            else:
-                                full_url = "https://www.ozon.ru" + href
-                            results.append({
-                                "platform": "Ozon",
-                                "title": card_title,
-                                "price": price,
-                                "url": full_url,
-                                "image_url": image_url,
-                                "location": None,
-                            })
-                    except Exception as card_err:
-                        log("[ENGINE OZON]", "Пропущена карточка: " + str(card_err))
-                        continue
-
-                browser.close()
+                finally:
+                    # Раньше при исключении между launch() и browser.close() браузер
+                    # мог не закрыться корректно - теперь закрываем гарантированно.
+                    if browser is not None:
+                        browser.close()
         except Exception as e:
             log("[ENGINE OZON]", "Критический сбой Playwright: " + str(e))
 
